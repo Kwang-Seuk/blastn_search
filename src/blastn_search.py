@@ -1,85 +1,165 @@
+import os
+import logging
 import json
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, Future, as_completed
 from Bio.Blast import NCBIWWW, NCBIXML
-from Bio import SeqIO
-from Bio.SeqRecord import SeqRecord
-from Bio.Blast.Record import Blast
-from typing import List
+from Bio import SeqIO, Entrez
 from tqdm import tqdm
+from typing import List, Tuple, Dict, Union
+
+logging.basicConfig(filename="blastn_and_parse.log", level=logging.INFO)
 
 
-def blastn(sequence: str) -> NCBIXML.Blast:
+def read_config(file_path: str) -> Tuple[str, str]:
+    if os.path.exists(file_path):
+        with open(file_path, "r") as file:
+            email = file.readline().strip()
+            api_key = file.readline().strip()
+        return email, api_key
+    else:
+        raise Exception(
+            "Config file not found. Please provide a valid file path."
+        )
+
+
+def blastn(sequence: str) -> NCBIXML.Record:
     result_handle = NCBIWWW.qblast("blastn", "nt", sequence)
     blast_record = NCBIXML.read(result_handle)
     return blast_record
 
 
+def get_taxa_info(tax_id: str) -> Dict[str, str]:
+    try:
+        handle = Entrez.efetch(db="taxonomy", id=tax_id, retmode="xml")
+        records = Entrez.read(handle)
+        tax_info = records[0]["LineageEx"]
+        return {i["Rank"]: i["ScientificName"] for i in tax_info}
+    except Exception as e:
+        logging.error(f"Failed to get taxa info for {tax_id}: {e}")
+        return {"Error": str(e)}
+
+
 def parse_results(
-    blast_record: NCBIXML.Blast, fasta: SeqIO.SeqRecord, hit_seqs: int
-) -> List[dict]:
+    blast_record: NCBIXML.Record, fasta: SeqIO.SeqRecord, hit_seqs: int
+) -> List[Dict[str, Union[str, int, float, Dict[str, str]]]]:
+    if not blast_record.alignments:
+        return [
+            {
+                "sequence_id": fasta.id,
+                "message": "No results are available for this sequence.",
+            }
+        ]
+
     result_list = []
     for alignment in blast_record.alignments[:hit_seqs]:
         for hsp in alignment.hsps:
             species = " ".join(alignment.title.split(" ")[1:3])
+            tax_id = alignment.title.split("|")[3]
+            taxa_info = get_taxa_info(tax_id)
             result_dict = {
                 "sequence_id": fasta.id,
                 "sequence_description": fasta.description,
                 "alignment_length": alignment.length,
                 "e_value": hsp.expect,
+                "identity_percentage": hsp.identities / hsp.align_length,
                 "species": species,
+                "taxa_info": taxa_info,
             }
             result_list.append(result_dict)
     return result_list
 
 
-def blastn_and_parse(file_path, hit_seqs):
-    fasta_sequences = list(SeqIO.parse(open(file_path), "fasta"))
-    results = []
+def blastn_sequences(
+    executor: ThreadPoolExecutor,
+    fasta_sequences: List[SeqIO.SeqRecord],
+    start_index: int,
+    end_index: int,
+) -> Dict[Future, SeqIO.SeqRecord]:
+    step_futures = {
+        executor.submit(blastn, str(fasta.seq)): fasta
+        for fasta in fasta_sequences[start_index:end_index]
+    }
+    while True:
+        time.sleep(3)
+        completed = [f for f in step_futures if f.done()]
+        if len(completed) >= len(step_futures) / 2:
+            break
+    return step_futures
 
-    with ThreadPoolExecutor() as executor:
-        for i in range(0, len(fasta_sequences), 30):
-            step_futures = {
-                executor.submit(blastn, str(fasta.seq)): fasta
-                for fasta in fasta_sequences[i : i + 10]
-            }
-            completed = []
 
-            while (
-                len(completed) < len(step_futures) / 2
-            ):  # 50% of results received
-                time.sleep(3)
-                completed = [f for f in step_futures if f.done()]
-
-            step_futures.update(
-                {
-                    executor.submit(blastn, str(fasta.seq)): fasta
-                    for fasta in fasta_sequences[i + 10 : i + 20]
-                }
+def parse_and_save_results(
+    step_futures: Dict[Future, SeqIO.SeqRecord],
+    results: List[Dict[str, Union[str, int, float, Dict[str, str]]]],
+    hit_seqs: int,
+) -> List[Dict[str, Union[str, int, float, Dict[str, str]]]]:
+    for future in as_completed(step_futures):
+        fasta = step_futures[future]
+        try:
+            blast_record = future.result()
+            parsed_results = parse_results(blast_record, fasta, hit_seqs)
+            if parsed_results:
+                results.extend(parsed_results)
+            if len(results) % 5 == 0:
+                file_name = f"blast_results_{time.time()}.json"
+                with open(
+                    file_name, "w"
+                ) as f:  # changed to create new file for each run
+                    json.dump(results, f, indent=4)
+        except Exception as e:
+            logging.error(
+                f"Failed to get results for sequence {fasta.id}: {e}"
             )
-            completed = []
-            while (
-                len(completed) < len(step_futures) / 2
-            ):  # 50% of results received
-                time.sleep(3)
-                completed = [f for f in step_futures if f.done()]
+    return results
 
-            step_futures.update(
-                {
-                    executor.submit(blastn, str(fasta.seq)): fasta
-                    for fasta in fasta_sequences[i + 20 : i + 30]
-                }
-            )
 
-            for future in as_completed(step_futures):
-                fasta = step_futures[future]
-                try:
-                    blast_record = future.result()
-                    results.extend(
-                        parse_results(blast_record, fasta, hit_seqs)
-                    )
-                except Exception as e:
-                    print(f"Failed to get results for {fasta.id}: {e}")
+def blastn_and_parse(file_path, hit_seqs) -> None:
+    if os.path.exists(file_path):  # added file existence check
+        fasta_sequences = list(SeqIO.parse(open(file_path), "fasta"))
+        total_seqs = len(fasta_sequences)
+        results: List[Dict[str, Union[str, int, float, Dict[str, str]]]] = []
 
-    with open("blast_results.json", "w") as f:
-        json.dump(results, f, indent=4)
+        # Compute total steps for tqdm, updated part
+        total_steps = total_seqs // 10
+        if total_seqs % 10 != 0:
+            total_steps += 1
+
+        # Create tqdm object for tracking progress, updated part
+        pbar = tqdm(total=total_steps, ncols=60)
+
+        # Store names of intermediate files, added part
+        intermediate_files: List[str] = []
+
+        with ThreadPoolExecutor() as executor:
+            for i in range(0, total_seqs, 10):  # Change batch size to 10
+                step_futures = blastn_sequences(
+                    executor, fasta_sequences, i, i + 10
+                )
+                results = parse_and_save_results(
+                    step_futures, results, hit_seqs
+                )
+
+                # Increment progress bar and update description, updated part
+                pbar.update(1)
+                pbar.set_description(f"Progress: {pbar.n}/{total_steps}")
+
+                # Save intermediate results every 5 sequences, updated part
+                if len(results) % 5 == 0:
+                    file_name = f"blast_results_{time.time()}.json"
+                    with open(file_name, "w") as f:
+                        json.dump(results, f, indent=4)
+
+                    # Store name of intermediate file, added part
+                    intermediate_files.append(file_name)
+
+        # Save final results
+        final_file_name = f"blast_results_{time.time()}.json"
+        with open(final_file_name, "w") as f:
+            json.dump(results, f, indent=4)
+
+        # Delete intermediate files, leaving the final file, added part
+        for file_name in intermediate_files:
+            os.remove(file_name)
+
+    else:
+        print(f"File {file_path} not found.")
