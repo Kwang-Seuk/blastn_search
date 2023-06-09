@@ -1,12 +1,14 @@
 import os
 import logging
 import json
+import yaml
+import pandas as pd
+from tqdm import tqdm
 import time
+from typing import List, Tuple, Dict, Union, Any
 from concurrent.futures import ThreadPoolExecutor, Future, as_completed
 from Bio.Blast import NCBIWWW, NCBIXML
 from Bio import SeqIO, Entrez
-from tqdm import tqdm
-from typing import List, Tuple, Dict, Union
 
 logging.basicConfig(filename="blastn_and_parse.log", level=logging.INFO)
 
@@ -113,7 +115,33 @@ def parse_and_save_results(
     return results
 
 
-def blastn_and_parse(file_path, hit_seqs) -> None:
+def save_results(
+    results: List[Dict[str, Any]], file_format: str = "json"
+) -> str:
+
+    file_name = f"blast_results_{time.time()}.{file_format}"
+    if file_format == "json":
+        with open(file_name, "w") as f:
+            json.dump(results, f, indent=4)
+    elif file_format == "yaml":
+        with open(file_name, "w") as f:
+            yaml.dump(results, f)
+    elif file_format in ["csv", "tsv"]:
+        df = pd.DataFrame(results)
+        if file_format == "csv":
+            df.to_csv(file_name, index=False)
+        elif file_format == "tsv":
+            df.to_csv(file_name, sep="\t", index=False)
+    else:
+        raise ValueError(f"Unsupported file format: {file_format}")
+
+    return file_name
+
+
+def blastn_and_parse(
+    file_path: str, hit_seqs: int, file_format: str = "json"
+) -> str:
+
     if os.path.exists(file_path):  # added file existence check
         fasta_sequences = list(SeqIO.parse(open(file_path), "fasta"))
         total_seqs = len(fasta_sequences)
@@ -145,21 +173,19 @@ def blastn_and_parse(file_path, hit_seqs) -> None:
 
                 # Save intermediate results every 5 sequences, updated part
                 if len(results) % 5 == 0:
-                    file_name = f"blast_results_{time.time()}.json"
-                    with open(file_name, "w") as f:
-                        json.dump(results, f, indent=4)
-
+                    file_name = save_results(results, file_format=file_format)
                     # Store name of intermediate file, added part
                     intermediate_files.append(file_name)
 
         # Save final results
-        final_file_name = f"blast_results_{time.time()}.json"
-        with open(final_file_name, "w") as f:
-            json.dump(results, f, indent=4)
+        final_file_name = save_results(results, file_format=file_format)
 
         # Delete intermediate files, leaving the final file, added part
         for file_name in intermediate_files:
-            os.remove(file_name)
+            if file_name != final_file_name:
+                os.remove(file_name)
 
     else:
         print(f"File {file_path} not found.")
+
+    return final_file_name
